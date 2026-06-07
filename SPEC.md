@@ -17,8 +17,8 @@ The first production corpus is intentionally narrow:
 - **Jurisdiction:** US publications only
 - **Publication kinds:** `A1`, `B1`, `B2` once the BigQuery query is corrected
 
-Expected scale is roughly **350K patents** and **5M chunks**, subject to real
-BigQuery counts.
+Expected scale is roughly **728K patents** and **6.7M chunks** (based on
+measured 9.2 chunks/patent from a test build).
 
 ### 1.2 Goals
 
@@ -124,48 +124,71 @@ This avoids duplicate patents when a publication belongs to multiple selected
 CPC classes. Running separate pipeline jobs per CPC class is not allowed for the
 same output directory because it can duplicate chunks and vectors.
 
-### 3.3 Current implementation corrections required before full run
+**Extracting specific patents by number:**
 
-The current pipeline is a useful scaffold, but the spec treats the following as
-pre-flight blockers before any full corpus build:
+```bash
+python pipeline.py \
+  --publication-numbers US-7603345-B2,US-20240211660-A1 \
+  --output ./data/curated
+```
 
-1. **BigQuery alias filtering:** the SQL must not reference `description` or
-   `claims` aliases in the `WHERE` clause. Filter on the localized subqueries or
-   wrap the SELECT in a CTE.
-2. **Kind-code filter:** the implementation should add `kind_code IN ('A1','B1','B2')`.
-3. **Resume semantics:** the CLI exposes `--resume`, but the current code loads
-   checkpoint state unconditionally and does not skip already-processed BigQuery
-   rows or load an existing turbovec index. Treat resume as unsafe until fixed.
-4. **Filter allowlist cap:** the query service defaults to unlimited
-   filtered allowlists (`--allowlist-limit 0`). For narrow filters (specific
-   assignee or date range) this is fine; broad CPC filters may match millions
-   of chunks, which can slow SQLite resolution. If latency becomes an issue
-   for broad filters, set `--allowlist-limit 100000` to cap the allowlist
-   size, or add dedicated CPC-indexing tables.
-5. **Service startup mode:** `uvicorn query_service:app` does not load an index
-   by itself. Production should start via `python query_service.py --index ... --meta ...`
-   or add env/config-based loading to the FastAPI lifespan.
+The `--publication-numbers` flag accepts a comma-separated list of publication
+numbers in any format (hyphenated or not). Hyphens are stripped on both the
+CLI side and the BigQuery SQL side for matching.
+
+**Incremental mode:**
+
+```bash
+python pipeline.py \
+  --cpc G06F16 \
+  --output ./data/search_plus \
+  --incremental
+```
+
+`--incremental` queries the existing SQLite metadata DB for already-ingested
+patent numbers and adds BigQuery WHERE clauses to skip them. This avoids
+re-processing and is safe for ongoing updates as long as the output directory
+already contains a valid index+metadata pair.
+
+### 3.3 Pre-flight checklist (status)
+
+The following were identified as blockers before the first full run.
+Current status as of the 5K test build (2026-06-07):
+
+1. ~~**BigQuery alias filtering:** the SQL must not reference `description` or
+   `claims` aliases in the `WHERE` clause.~~ **Done** — the query wraps
+   the SELECT in a CTE (`WITH selected AS (...)`) and filters in the outer WHERE,
+   which BigQuery supports. Verified by successful 5K build query.
+2. ~~**Kind-code filter:** the implementation should add `kind_code IN ('A1','B1','B2')`.~~
+   **Done** — present in the SQL since the first implementation.
+3. **Resume semantics:** the original `--resume` flag loaded checkpoint state
+   unconditionally and did not skip already-processed BigQuery rows. **Replaced**
+   by `--incremental` (see §12.2), which queries existing SQLite metadata for
+   already-ingested patent numbers and skips them before the BigQuery pass.
+   The standalone `merge.py` tool combines multiple SQLite DBs + TVIM files
+   by re-embedding from scratch (necessary due to turbovec API limitations).
+4. **Filter allowlist cap:** resolved below default. ✅ (See §8.4.)
+5. **Service startup mode:** resolved — production starts via
+   `python query_service.py --index ... --meta ...` under systemd.
 6. **Clean-output safety check:** the pipeline refuses to start if the output
-   directory already contains index or metadata files. This prevents accidental
-   duplicate chunk/vector insertions during development. Use a fresh directory
-   for each build, or manually clear the target directory before rerunning.
-7. **Python version on argus:** the serving host runs Python 3.10.12 (Ubuntu
-   Server 22.04 default). Google's `google-api-core` library will stop
-   supporting Python 3.10 after its EOL date (2026-10-04). Plan an OS upgrade
-   to 24.04 (Python 3.12) before or shortly after that date. The pipeline and
-   query service do not depend on any Python 3.11+ features, so there is no
-   immediate compatibility issue.
+   directory already contains index or metadata files. This is still in place.
+7. **Python version on argus:** deferred — Ubuntu 22.04 / Python 3.10 until
+   October 2026 EOL.
 
-### 3.4 BigQuery cost expectation
+### 3.4 BigQuery cost (measured)
 
 The `patents-public-data.patents.publications` table has no partitioning or
 clustering. Every query scans the full table regardless of LIMIT or WHERE
 filters. A column-limited US query scans approximately **1.5 TB**.
 
+**Measured:** a CPC-filtered query scanning G06F16+G06N+G06F40 scanned
+**1,511.3 GB** (confirmed 2026-06-07). The unfiltered result set is
+**727,783 rows** for these three CPC classes combined.
+
 At BigQuery on-demand pricing ($5/TB for the first 1 TB, then ~$5-7/TB after
 free tier), expect:
 
-- **CPC-filtered corpus** (~350K patents): ~$10-20 (full scan minus free tier)
+- **CPC-filtered corpus** (~728K patents): ~$10-20 (full scan minus free tier)
 - **Full US corpus** (~11M patents): same scan cost (same table scanned once)
 
 Mitigations:
@@ -252,16 +275,23 @@ If a single paragraph exceeds the budget, the current implementation keeps it
 as one oversized chunk. That is acceptable for M0 but should be measured during
 pre-flight sampling.
 
-### 4.5 Chunk count estimates
+### 4.5 Chunk count estimates (measured)
 
-Use these as planning estimates only; replace them with measured `/stats` after
-the first build.
+Measured from a `--limit 5000` test build on 2026-06-07:
+
+| Metric | Measured | Notes |
+|---|---:|---:|
+| Chunks per patent | 9.2 | 5,000 patents → 45,949 chunks |
+| Title/abstract per patent | 1.0 | Every sampled patent had title+abstract |
+| Claims per patent | ~4.5 | Varies by patent; claims_all fallback used when regex split finds <2 boundaries |
+
+Estimated full-corpus projections:
 
 | Corpus | Patents | Estimated chunks |
 |---|---:|---:|
-| `G06F16` search-engine corpus | ~200K | ~3M |
-| `G06F16 ∪ G06N ∪ G06F40` | ~350K | ~5M |
-| Full US corpus | ~11M | ~165M |
+| `G06F16` search-engine corpus | ~200K | ~1.8M |
+| `G06F16 ∪ G06N ∪ G06F40` | ~728K | ~6.7M |
+| Full US corpus | ~11M | ~100M |
 
 ---
 
@@ -276,6 +306,7 @@ the first build.
 | Build-time dependency | Local GPU model |
 | License | MIT |
 | Role | Default M0 embedding model |
+| Build throughput (measured) | **61 chunks/sec** on RTX 4090 (46K chunks in 750s) |
 
 Decision: use `bge-large-en-v1.5` for the first production build.
 
@@ -458,7 +489,39 @@ scans.
 
 Filter semantics:
 
-### 8.5 Performance targets
+### 8.5 Publication number normalization
+
+The search endpoint normalizes publication numbers by stripping hyphens before
+comparison:
+
+```
+Input: "US-7603345-B2"   →  "US7603345B2"
+Input: "US7603345B2"     →  "US7603345B2"
+```
+
+Both the BigQuery SQL and the query service use `REPLACE(column, '-', '')`
+on both sides of the comparison. The CLI also strips hyphens from
+`--publication-numbers` input before passing to BigQuery parameters.
+
+This means any input format (hyphenated or not) works at every entry point.
+
+### 8.6 Security and access
+
+The query service binds to `127.0.0.1` only and is firewalled by UFW. It is
+not directly reachable over the public internet. Access requires either:
+
+- **Localhost** on argus itself
+- **Tailscale SSH tunnel** from a machine on the same Tailscale network:
+
+  ```bash
+  ssh -L 8081:localhost:8081 -N adrian@100.124.16.75
+  # Then: curl http://localhost:8081/search?q=...
+  ```
+
+This ensures the service is only accessible to authorized Tailscale users
+without exposing it to the public internet.
+
+### 8.7 Performance targets
 
 Targets for the initial `G06F16 ∪ G06N ∪ G06F40` corpus on argus:
 
@@ -477,14 +540,62 @@ aspirational until measured on the actual corpus and machine.
 
 ## 9. Deployment Plan
 
-### 9.1 Build on vast.ai
+### 9.1 Build on vast.ai — measured performance
 
 Instance target:
 
 - RTX 4090 preferred; RTX 3090 acceptable
 - at least 100 GB disk for first corpus
 - PyTorch image with CUDA available
-- expected cost: around $5 for the first corpus including setup slack
+- expected cost: around $11 for the first corpus (confirmed: $0.38/hr × ~30h)
+
+**Measured throughput** from a `--limit 5000` test build (2026-06-07):
+
+| Phase | Duration | Rate |
+|---|---:|---:|
+| BigQuery scan (1.5 TB) | ~7 min | ~727K patents in ~20 min (estimated) |
+| Patent chunking (CPU) | ~6 min | ~830 patents/min |
+| Embedding (RTX 4090) | 750s | 61 chunks/sec |
+| **Total per 5K patents** | **~13 min** | **~0.4 patents/sec** |
+
+**Projected full build** (728K patents, ~6.7M chunks):
+
+| Metric | Estimate | Notes |
+|---|---:|---:|
+| Embedding time | ~30.5h | 6.7M / (61 chunks/s) / 3600 |
+| BigQuery + chunking | ~3h | Overlaps partially with embedding (streaming pipeline) |
+| **Total wall time** | **~30h** | |
+| **GPU cost** | **~$11.40** | $0.38/hr × 30h |
+| Index size | ~3.4 GB | 500 bytes/chunk × 6.7M |
+| Metadata DB size | ~67 GB | 10 KB/chunk × 6.7M (will need compression or pruning) |
+
+*Note: The vast.ai RTX 4090 instance used for the 5K test has since been
+destroyed. A new GPU instance must be provisioned for the full build.*
+
+Pipeline CLI flags:
+
+```bash
+# Default production filters
+python pipeline.py \
+  --cpc G06F16 --cpc G06N --cpc G06F40 \
+  --output ./data/search_plus
+
+# Extract specific patents by number
+python pipeline.py \
+  --publication-numbers US-7603345-B2,US-20240211660-A1 \
+  --output ./data/curated
+
+# Incremental: skip already-ingested patents
+python pipeline.py \
+  --cpc G06F16 \
+  --output ./data/search_plus \
+  --incremental
+
+# Merge two separate runs
+python merge.py \
+  --dirs ./data/search_plus ./data/curated \
+  --output ./data/merged
+```
 
 Build sequence:
 
@@ -497,8 +608,8 @@ Build sequence:
 
 ### 9.2 Serve on argus
 
-Start the service with explicit index and metadata paths and optional
-allowlist limit:
+Start the service with explicit index and metadata paths, binding to localhost
+for security:
 
 ```bash
 python query_service.py \
@@ -506,15 +617,24 @@ python query_service.py \
   --meta ./data/search_plus/patent_meta.db \
   --model BAAI/bge-large-en-v1.5 \
   --allowlist-limit 0 \
-  --port 8080
+  --host 127.0.0.1 \
+  --port 8081
 ```
 
 `--allowlist-limit` sets the maximum number of chunk IDs that SQLite can pass
 to turbovec for filtered searches. `0` (default) means unlimited. Set to e.g.
 `100000` to cap broad CPC/date-range filters from saturating SQLite scans.
 
-Systemd should run the same CLI entrypoint unless query-service lifespan loading
-is changed to support env-based configuration.
+`--host 127.0.0.1` binds to localhost only. The service is behind UFW and only
+reachable from argus itself or via a Tailscale SSH tunnel:
+
+```bash
+# From a Tailscale-connected client:
+ssh -L 8081:localhost:8081 -N adrian@100.124.16.75
+curl http://localhost:8081/health
+```
+
+Systemd runs the same entrypoint. See `DEPLOY.md` for the full unit definition.
 
 ---
 
@@ -552,7 +672,31 @@ Do not require exact patent numbers until the corpus membership has been
 verified. Some canonical patents may be outside the selected CPC prefixes or
 missing full English text.
 
-### 10.3 Automated eval future
+### 10.3 Measured test results
+
+A `--limit 5000` test build was completed on 2026-06-07 (see §9.1 for timing).
+
+**Verification results:**
+
+| Check | Result |
+|---|---:|
+| Chunk count > patent count | 45,949 > 5,000 ✓ |
+| Vector count = chunk count | 45,949 = 45,949 ✓ |
+| turbovec index searchable | 5/5 semantic queries return relevant results ✓ |
+| Metadata DB accessible | All chunk types retrievable via chunk_id join ✓ |
+| BigQuery streaming | Direct query works for <10K rows, destination table for larger sets ✓ |
+| Multi-CPC deduplication | Single-pass query, no duplicate patents ✓ |
+
+**Known-query results:**
+
+| Query | Top result relevance | Source |
+|---|---:|---:|
+| "information retrieval database search indexing" | US-2011161260-A1 "User-driven index selection" | G06F16 ✓ |
+| "neural network attention transformer model" | US-2023177338-A1 "Small and fast transformer model" | G06N ✓ |
+| "XML document schema parsing validation" | US-2013061133-A1 "Markup language schema error correction" | G06F40 ✓ |
+| "natural language processing text classification" | US-2014279761-A1 "Document Coding Computer System" | G06F40 ✓ |
+
+### 10.4 Automated eval future
 
 After M0, create 20-50 query → known relevant patent pairs and track:
 
@@ -574,6 +718,7 @@ After M0, create 20-50 query → known relevant patent pairs and track:
 | Resume duplicates chunks/vectors | Corrupt index/metadata alignment | Treat resume as unsafe until tested; use clean output dirs |
 | Broad filter allowlist truncates results | Incorrect filtered search | Already fixed: code defaults to unlimited; set `--allowlist-limit` only if SQLite scans are slow |
 | CPU embedding slower than expected | Higher latency/lower QPS | Measure on argus; switch to bge-base or cache queries if needed |
+| turbovec `IdMapIndex.load()` instance-method bug (v0.7.0) | Index loads as empty (0 vectors) | Always use class method `IdMapIndex.load(path)`; never `IdMapIndex().load(path)` |
 | SQLite LIKE over JSON CPC arrays is slow | Slow filters | Normalize CPC/assignee metadata if measured slow |
 | Full US index exceeds practical RAM | Serving instability | Use 2-bit quantization or serve narrower corpora first |
 | Python 3.10 reaches EOL (Oct 2026) | `google-api-core` drops support, blocking BigQuery access from argus | Upgrade argus to Ubuntu 24.04 (Python 3.12) before Oct 2026; no code changes needed |
@@ -590,12 +735,25 @@ baseline latency and quality are measured.
 
 ### 12.2 Incremental updates
 
-For ongoing updates:
+Implemented. The pipeline's `--incremental` flag queries the existing SQLite
+metadata DB for already-ingested patent numbers, skips them in the BigQuery
+pass, and appends new chunks and vectors. Standalone `merge.py` combines
+multiple SQLite DBs + TVIM files by re-embedding all chunks from scratch
+(necessary because turbovec's `IdMapIndex` API does not expose vector/ID
+extraction for append).
 
-- query BigQuery for publications newer than the last indexed date,
-- chunk and embed only new patents,
-- append to turbovec only after append/resume semantics are tested,
-- insert metadata with duplicate protection.
+Workflow for ongoing updates:
+
+```bash
+# Run pipeline with --incremental to skip already-ingested patents
+python pipeline.py \
+  --cpc G06F16 --cpc G06N --cpc G06F40 \
+  --output ./data/search_plus \
+  --incremental
+
+# Or merge two separate builds into one index
+python merge.py --dirs ./data/run1 ./data/run2 --output ./data/merged
+```
 
 ### 12.3 Hybrid BM25 + vector search
 

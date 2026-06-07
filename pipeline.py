@@ -72,6 +72,10 @@ class Config:
     years: Optional[tuple] = None          # (start, end) e.g. (2015, 2026)
     batch_size: int = 5_000               # Rows per BigQuery page
     max_chunks_per_batch: int = 64_000    # Chunks before embed + index flush
+    max_bytes_billed: int = 2_000_000_000_000  # Hard BigQuery cost cap (~2 TB).
+                                          # Queries exceeding this ERROR at $0
+                                          # instead of billing. ~1.5 TB is the
+                                          # normal scan for the CPC corpus.
 
     # Embedding
     model_name: str = "BAAI/bge-large-en-v1.5"
@@ -90,6 +94,8 @@ class Config:
     checkpoint_path: str = "pipeline_checkpoint.json"
     resume: bool = False                  # Reserved until safe resume is implemented
     incremental: bool = False             # Append to existing index rather than rebuild
+    from_cache: Optional[str] = None      # Read patents from a local Parquet stash
+                                          # instead of BigQuery (free; no scan).
 
     # Output
     output_dir: str = "./data"
@@ -314,10 +320,22 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
     job_config = bigquery.QueryJobConfig(
         query_parameters=bq_params,
         dry_run=True,
+        maximum_bytes_billed=cfg.max_bytes_billed,
     )
     dry = client.query(query, job_config=job_config)
-    log.info(f"  Data scanned: {dry.total_bytes_processed / 1e9:.1f} GB "
-             f"(free tier: 1 TB/month)")
+    scanned = dry.total_bytes_processed
+    est_cost = max(0.0, (scanned / 1e12) * 6.25)  # ~$6.25/TB on-demand (US)
+    log.info(f"  Data scanned: {scanned / 1e9:.1f} GB  (~${est_cost:.2f}, "
+             f"free tier: 1 TB/month)")
+
+    # Hard cost guard: abort BEFORE the paid query if the scan exceeds the cap.
+    # The dry-run above is free, so this never costs anything.
+    if scanned > cfg.max_bytes_billed:
+        raise RuntimeError(
+            f"Query would scan {scanned/1e9:.1f} GB, over the "
+            f"{cfg.max_bytes_billed/1e9:.0f} GB cap (--max-gb-billed). "
+            f"Aborted before billing. Raise the cap only if this is expected."
+        )
 
     # For large result sets, use a temporary destination table.
     # Without a LIMIT, the REST API response limit (~10 GB) can be exceeded.
@@ -389,6 +407,52 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
             }
 
     log.info(f"  Total patents returned: {total}")
+
+
+def read_cached_patents(cfg: Config) -> Generator[dict, None, None]:
+    """Yield patents from a local Parquet stash instead of BigQuery.
+
+    Reads either a single .parquet file or a directory of .parquet shards.
+    Produces the exact same dict shape as stream_patents() so the rest of the
+    pipeline is identical — but costs $0 (no BigQuery scan).
+    """
+    import glob
+    import pyarrow.parquet as pq
+
+    path = cfg.from_cache
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.parquet")))
+    else:
+        files = [path]
+    if not files:
+        raise FileNotFoundError(f"No .parquet files found at {path}")
+    log.info(f"Reading patents from cache: {len(files)} file(s) at {path}")
+
+    def _as_list(v):
+        return [] if v is None else list(v)
+
+    total = 0
+    for fp in files:
+        pf = pq.ParquetFile(fp)
+        for batch in pf.iter_batches(batch_size=2000):
+            for row in batch.to_pylist():
+                total += 1
+                yield {
+                    "publication_number": row.get("publication_number") or "",
+                    "country_code": row.get("country_code") or "",
+                    "kind_code": row.get("kind_code") or "",
+                    "title": row.get("title") or "",
+                    "abstract": row.get("abstract") or "",
+                    "claims": row.get("claims") or "",
+                    "description": row.get("description") or "",
+                    "ipc_codes": _as_list(row.get("ipc_codes")),
+                    "cpc_codes": _as_list(row.get("cpc_codes")),
+                    "filing_date": str(row.get("filing_date") or ""),
+                    "publication_date": str(row.get("publication_date") or ""),
+                    "assignee": row.get("assignee") or "",
+                    "inventor": row.get("inventor") or "",
+                }
+    log.info(f"  Total patents from cache: {total}")
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +915,7 @@ def run_pipeline(cfg: Config):
         checkpoint = Checkpoint(str(checkpoint_path))
         pipeline = EmbedIndexPipeline(cfg, meta)
 
-    patents_stream = stream_patents(cfg)
+    patents_stream = read_cached_patents(cfg) if cfg.from_cache else stream_patents(cfg)
 
     try:
         with tqdm(desc="Patents processed", unit="pat") as pbar:
@@ -914,6 +978,9 @@ def main():
                         help="Reserved for future safe resume support; currently exits with an error")
     parser.add_argument("--incremental", action="store_true",
                         help="Append to existing index instead of rebuilding from scratch")
+    parser.add_argument("--from-cache", metavar="PATH",
+                        help="Read patents from a local Parquet stash (file or dir) "
+                             "instead of BigQuery — free, no scan. Skips all BQ flags.")
 
     # Runtime
     parser.add_argument("--device", default="cuda",
@@ -927,6 +994,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=512,
                         help="GPU embedding batch size (default: 512 for 24GB GPUs; "
                              "use 32 on a 16GB T4, 16 if it still OOMs)")
+    parser.add_argument("--max-gb-billed", type=float, default=2000.0,
+                        help="Hard BigQuery cost cap in GB (default: 2000 = 2 TB). "
+                             "Queries scanning more ERROR at $0 instead of billing.")
 
     args = parser.parse_args()
 
@@ -939,12 +1009,14 @@ def main():
         country=args.country,
         years=tuple(args.years) if args.years else None,
         embed_batch_size=args.batch_size,
+        max_bytes_billed=int(args.max_gb_billed * 1e9),
         bit_width=args.bits,
         model_name=args.model,
         device=args.device,
         output_dir=args.output,
         resume=args.resume,
         incremental=args.incremental,
+        from_cache=args.from_cache,
     )
 
     run_pipeline(cfg)

@@ -37,6 +37,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator, Optional
@@ -170,6 +171,7 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
     client = bigquery.Client(project=cfg.project)
     query = build_query(cfg)
     params = build_query_params(cfg)
+    dataset_id = f"{cfg.project}.patent_kb_temp"
 
     log.info("Querying BigQuery...")
     log.info(f"  Dataset: {cfg.dataset}.{cfg.table}")
@@ -194,10 +196,39 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
     log.info(f"  Data scanned: {dry.total_bytes_processed / 1e9:.1f} GB "
              f"(free tier: 1 TB/month)")
 
-    # Real query
+    # For large result sets, use a temporary destination table.
+    # Without a LIMIT, the REST API response limit (~10 GB) can be exceeded.
     job_config.dry_run = False
-    job = client.query(query, job_config=job_config)
-    result = job.result()
+    if cfg.limit and cfg.limit < 10000:
+        # Small query — stream directly
+        job = client.query(query, job_config=job_config)
+        result = job.result()
+    else:
+        # Large query — use temporary destination table to avoid response limit
+        temp_table_id = f"patent_kb_results_{uuid.uuid4().hex[:8]}"
+        job_config.destination = bigquery.TableRef.from_string(
+            f"{dataset_id}.{temp_table_id}"
+        )
+        job_config.write_disposition = "WRITE_TRUNCATE"
+        # Ensure the temp dataset exists
+        dataset_ref = bigquery.DatasetReference.from_string(dataset_id)
+        try:
+            client.create_dataset(dataset_ref, exists_ok=True)
+        except Exception:
+            pass  # dataset may already exist
+        # With destination table, allow_large_results is enabled by default
+        job = client.query(query, job_config=job_config)
+        log.info(f"  Writing large results to {dataset_id}.{temp_table_id}...")
+        job.result()
+        log.info("  Reading results from temp table...")
+        table_ref = f"{dataset_id}.{temp_table_id}"
+        result = client.query(f"SELECT * FROM `{table_ref}` ORDER BY publication_number")
+        result = result.result()
+        # Clean up temp table
+        try:
+            client.delete_table(f"{dataset_id}.{temp_table_id}")
+        except Exception:
+            pass
 
     total = 0
     for page in result.pages:

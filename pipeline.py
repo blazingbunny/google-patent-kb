@@ -206,7 +206,8 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
     else:
         # Large query — use temporary destination table to avoid response limit
         temp_table_id = f"patent_kb_results_{uuid.uuid4().hex[:8]}"
-        dataset_ref = bigquery.DatasetReference(cfg.project, "patent_kb_temp")
+        dest_project = client.project or cfg.project
+        dataset_ref = bigquery.DatasetReference(dest_project, "patent_kb_temp")
         table_ref = dataset_ref.table(temp_table_id)
         job_config.destination = table_ref
         job_config.write_disposition = "WRITE_TRUNCATE"

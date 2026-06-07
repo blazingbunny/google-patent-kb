@@ -64,6 +64,9 @@ class PatentSearchEngine:
 
         log.info(f"Loading turbovec index: {index_path}")
         from turbovec import IdMapIndex
+        # NOTE: IdMapIndex.load(path) MUST be the classmethod form.
+        # The instance-method form IdMapIndex().load(path) silently returns
+        # 0 vectors in turbovec 0.7.0 (the instance is discarded by __init__).
         self.index = IdMapIndex.load(index_path)
         log.info(f"  Vectors: {len(self.index)}")
 
@@ -82,6 +85,7 @@ class PatentSearchEngine:
         assignee_filter: Optional[str] = None,
         chunk_type: Optional[str] = None,
         years: Optional[tuple] = None,
+        publication_number: Optional[str] = None,
     ) -> dict:
         """Full search: embed → vector search → metadata join."""
         t0 = time.time()
@@ -93,9 +97,9 @@ class PatentSearchEngine:
 
         # 2. Optional: get allowlist from metadata filters
         allowlist = None
-        if any([cpc_filter, assignee_filter, chunk_type, years]):
+        if any([cpc_filter, assignee_filter, chunk_type, years, publication_number]):
             allowed_ids = self._resolve_filters(
-                cpc_filter, assignee_filter, chunk_type, years
+                cpc_filter, assignee_filter, chunk_type, years, publication_number
             )
             if allowed_ids is not None:
                 allowlist = np.array(allowed_ids, dtype=np.uint64)
@@ -138,7 +142,7 @@ class PatentSearchEngine:
             },
         }
 
-    def _resolve_filters(self, cpc, assignee, chunk_type, years):
+    def _resolve_filters(self, cpc, assignee, chunk_type, years, publication_number=None):
         """Resolve metadata filters to chunk_id allowlist."""
         clauses = []
         params = []
@@ -150,10 +154,13 @@ class PatentSearchEngine:
             clauses.append("p.publication_date BETWEEN ? AND ?")
             params.append(f"{years[0]}-01-01")
             params.append(f"{years[1]}-12-31")
+        if publication_number is not None:
+            clauses.append("REPLACE(p.patent_number, '-', '') = ?")
+            params.append(publication_number.replace("-", ""))
 
-        # For assignee and CPC, filter patents first
+        # For assignee, CPC, years, or publication_number, filter patents first
         patent_join = ""
-        if cpc or assignee:
+        if cpc or assignee or years or publication_number:
             if cpc:
                 clauses.append("p.cpc_codes LIKE ?")
                 params.append(f"%{cpc}%")
@@ -269,6 +276,7 @@ class SearchRequest(BaseModel):
     chunk_type: Optional[str] = None
     year_start: Optional[int] = None
     year_end: Optional[int] = None
+    publication_number: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -302,6 +310,7 @@ def search(req: SearchRequest):
         assignee_filter=req.assignee,
         chunk_type=req.chunk_type,
         years=years,
+        publication_number=req.publication_number,
     )
 
 
@@ -314,12 +323,14 @@ def search_get(
     chunk_type: Optional[str] = Query(None, description="chunk type: claim, claims_all, description, title_abstract"),
     year_start: Optional[int] = Query(None),
     year_end: Optional[int] = Query(None),
+    publication_number: Optional[str] = Query(None, description="Filter by patent number (any format)"),
 ):
     if engine is None:
         raise HTTPException(503, "Search engine not loaded")
     years = (year_start, year_end) if year_start and year_end else None
     return engine.search(q, k=k, cpc_filter=cpc, assignee_filter=assignee,
-                         chunk_type=chunk_type, years=years)
+                         chunk_type=chunk_type, years=years,
+                         publication_number=publication_number)
 
 
 @app.get("/patent/{patent_number}")
@@ -328,7 +339,8 @@ def get_patent(patent_number: str):
     if engine is None:
         raise HTTPException(503, "Search engine not loaded")
     cur = engine._conn.execute(
-        "SELECT * FROM patents WHERE patent_number = ?", (patent_number,)
+        "SELECT * FROM patents WHERE REPLACE(patent_number, '-', '') = ?",
+        (patent_number.replace("-", ""),)
     )
     patent = cur.fetchone()
     if not patent:

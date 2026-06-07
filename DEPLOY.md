@@ -14,11 +14,12 @@ vast.ai GPU instance (temporary, ~$5-10 total)
   │  Step 4: Build turbovec index
   │  Output: patent_index.tvim (~3 GB) + patent_meta.db (~10-20 GB)
   │
-  │  Step 5: scp both files to argus
+  │  Step 5: scp both files to argus (production server)
   ▼
-Argus (production, CPU-only)
+argus (hostname ns3540292, public 193.70.33.204, CPU-only)
   ├─ Load index + metadata
-  ├─ Serve FastAPI on port 8080
+  ├─ Serve FastAPI on port 8081 (8080 taken by OneUptime)
+  ├─ Bound to 127.0.0.1 only (behind Tailscale + UFW)
   └─ Query: embed on CPU (~50ms) + turbovec search (~ms)
 ```
 
@@ -109,20 +110,20 @@ The index file fits in argus's 125 GB RAM at 4-bit quantization. If you need
 has been implemented and tested. The checkpoint file is advisory progress state;
 it is not currently a duplicate-free resume mechanism.
 
-### 4. Deploy to argus
+### 4. Deploy to argus (production)
 
 ```bash
 # On your laptop, once pipeline finishes on vast.ai:
 scp -P <port> root@<ip>:./data/search_plus/patent_index.tvim .
 scp -P <port> root@<ip>:./data/search_plus/patent_meta.db .
 
-# Upload to argus
-scp patent_index.tvim adrian@argus:~/patent_kb/
-scp patent_meta.db adrian@argus:~/patent_kb/
-scp query_service.py adrian@argus:~/patent_kb/
+# Upload via Tailscale (or public IP if needed)
+scp patent_index.tvim adrian@100.124.16.75:~/patent_kb/
+scp patent_meta.db adrian@100.124.16.75:~/patent_kb/
+scp query_service.py adrian@100.124.16.75:~/patent_kb/
 
-# Install on argus (CPU inference)
-ssh adrian@argus
+# Install (CPU inference)
+ssh adrian@100.124.16.75
 cd ~/patent_kb
 pip install fastapi uvicorn turbovec sentence-transformers numpy
 
@@ -130,14 +131,15 @@ pip install fastapi uvicorn turbovec sentence-transformers numpy
 python query_service.py \
   --index ./patent_index.tvim \
   --meta ./patent_meta.db \
-  --model BAAI/bge-large-en-v1.5
+  --model BAAI/bge-large-en-v1.5 \
+  --host 127.0.0.1 --port 8081
 
 # Verify with a search
-curl http://localhost:8080/health
-curl 'http://localhost:8080/search?q=neural+network+transformer&k=5'
+curl http://127.0.0.1:8081/health
+curl 'http://127.0.0.1:8081/search?q=neural+network+transformer&k=5'
 ```
 
-### 5. Production service on argus (systemd)
+### 5. Production service (systemd)
 
 ```bash
 # Create service file
@@ -150,12 +152,15 @@ After=network.target
 Type=simple
 User=adrian
 WorkingDirectory=/home/adrian/patent_kb
-ExecStart=/home/adrian/.local/bin/uv run python query_service.py \
+ExecStart=/usr/bin/python3 /home/adrian/patent_kb/query_service.py \
   --index /home/adrian/patent_kb/patent_index.tvim \
   --meta /home/adrian/patent_kb/patent_meta.db \
-  --port 8080
+  --model BAAI/bge-large-en-v1.5 \
+  --host 127.0.0.1 --port 8081
+Environment=PATH=/home/adrian/.local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -165,26 +170,38 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now patent-search
 ```
 
+## Access (from adrian-laptop via Tailscale)
+
+The service is bound to 127.0.0.1 and firewalled. Access it through a Tailscale SSH tunnel:
+
+```bash
+# Start tunnel (one-shot):
+ssh -L 8081:localhost:8081 -N adrian@100.124.16.75
+
+# Then in another terminal:
+curl http://localhost:8081/health
+```
+
 ## Usage
 
 ```bash
 # Search by meaning
-curl 'http://argus:8080/search?q=wireless+charging+electric+vehicle&k=5'
+curl 'http://localhost:8081/search?q=wireless+charging+electric+vehicle&k=5'
 
 # Filter by CPC class + date range
-curl 'http://argus:8080/search?q=battery+thermal+management&cpc=H01M&year_start=2020&year_end=2024&k=10'
+curl 'http://localhost:8081/search?q=battery+thermal+management&cpc=H01M&year_start=2020&year_end=2024&k=10'
 
 # Filter to claims only
-curl 'http://argus:8080/search?q=neural+network+accelerator&chunk_type=claim&k=20'
+curl 'http://localhost:8081/search?q=neural+network+accelerator&chunk_type=claim&k=20'
 
 # Get full patent details
-curl 'http://argus:8080/patent/US7603345B2'
+curl 'http://localhost:8081/patent/US7603345B2'
 
 # Search by assignee
-curl 'http://argus:8080/search?q=attention+mechanism&assignee=Google&k=5'
+curl 'http://localhost:8081/search?q=attention+mechanism&assignee=Google&k=5'
 
 # Index stats
-curl 'http://argus:8080/stats'
+curl 'http://localhost:8081/stats'
 ```
 
 ## Performance on Argus (Xeon E-2388G, no GPU)

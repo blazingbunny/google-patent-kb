@@ -15,7 +15,8 @@ Usage
   # By technology class
   python pipeline.py --cpc G06F --output ./data/g06f
 
-  # Resume is not safe yet; use a clean output directory for reruns
+  # Resume is not safe yet; use --incremental to append to an existing index
+  # Or use a clean output directory for fresh builds
 
 Requirements (vast.ai instance)
 --------------------------------
@@ -64,6 +65,7 @@ class Config:
     dataset: str = "patents-public-data"   # Public dataset project
     table: str = "patents.publications"    # Main patent table
     limit: Optional[int] = None            # For testing — limit rows
+    publication_numbers: Optional[list[str]] = None  # Specific patents to fetch
     cpc: list[str] = None                  # Filter by CPC classes (e.g. ["G06F16", "G06N"])
     country: str = "US"                    # Jurisdiction
     years: Optional[tuple] = None          # (start, end) e.g. (2015, 2026)
@@ -86,6 +88,7 @@ class Config:
     metadata_path: str = "patent_meta.db"
     checkpoint_path: str = "pipeline_checkpoint.json"
     resume: bool = False                  # Reserved until safe resume is implemented
+    incremental: bool = False             # Append to existing index rather than rebuild
 
     # Output
     output_dir: str = "./data"
@@ -129,6 +132,8 @@ def build_query(cfg: Config) -> str:
             for i in range(len(cfg.cpc))
         )
         wheres.append(f"({cpc_clauses})")
+    if cfg.publication_numbers:
+        wheres.append("REPLACE(publication_number, '-', '') IN UNNEST(@pub_numbers)")
     if cfg.years:
         wheres.append("CAST(publication_date AS STRING) BETWEEN @start_date AND @end_date")
 
@@ -157,6 +162,8 @@ def build_query_params(cfg: Config) -> dict:
     if cfg.cpc:
         for i, c in enumerate(cfg.cpc):
             params[f"cpc{i}"] = f"{c}%"
+    if cfg.publication_numbers:
+        params["pub_numbers"] = [n.replace("-", "") for n in cfg.publication_numbers]
     if cfg.years:
         # publication_date is INT64; CAST to STRING in WHERE, then to DATE in SELECT
         params["start_date"] = f"{cfg.years[0]}0101"
@@ -185,11 +192,14 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
     log.info(f"  Query:\n{query}")
 
     # Estimate cost
+    bq_params = []
+    for k, v in params.items():
+        if isinstance(v, list):
+            bq_params.append(bigquery.ArrayQueryParameter(k, "STRING", v))
+        else:
+            bq_params.append(bigquery.ScalarQueryParameter(k, "STRING", v))
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter(k, "STRING", v)
-            for k, v in params.items()
-        ],
+        query_parameters=bq_params,
         dry_run=True,
     )
     dry = client.query(query, job_config=job_config)
@@ -484,6 +494,11 @@ class MetadataDB:
             ids.append(cur.lastrowid)
         return ids
 
+    def get_existing_patents(self) -> set[str]:
+        """Return set of patent_numbers already in the database."""
+        cur = self.conn.execute("SELECT patent_number FROM patents")
+        return {row[0] for row in cur.fetchall()}
+
     def commit(self):
         self.conn.commit()
 
@@ -534,9 +549,12 @@ class Checkpoint:
 class EmbedIndexPipeline:
     """Batch-embed chunks and add to turbovec index."""
 
-    def __init__(self, cfg: Config, meta_db: MetadataDB):
+    def __init__(self, cfg: Config, meta_db: MetadataDB,
+                 existing_index_path: Optional[str] = None,
+                 existing_patents: Optional[set[str]] = None):
         self.cfg = cfg
         self.meta = meta_db
+        self.existing_patents = existing_patents or set()
 
         log.info(f"Loading embedding model: {cfg.model_name}")
         from sentence_transformers import SentenceTransformer
@@ -547,9 +565,14 @@ class EmbedIndexPipeline:
         self.dim = self.model.get_sentence_embedding_dimension()
         log.info(f"  Embedding dimension: {self.dim}")
 
-        log.info(f"Creating turbovec index (dim={self.dim}, bit_width={cfg.bit_width})")
         from turbovec import IdMapIndex
-        self.index = IdMapIndex(dim=self.dim, bit_width=cfg.bit_width)
+        if existing_index_path and Path(existing_index_path).exists():
+            log.info(f"Loading existing turbovec index: {existing_index_path}")
+            self.index = IdMapIndex.load(existing_index_path)
+            log.info(f"  Loaded {len(self.index)} existing vectors")
+        else:
+            log.info(f"Creating fresh turbovec index (dim={self.dim}, bit_width={cfg.bit_width})")
+            self.index = IdMapIndex(dim=self.dim, bit_width=cfg.bit_width)
 
         # Buffer for current batch
         self.buffer_chunks: list[dict] = []
@@ -557,8 +580,14 @@ class EmbedIndexPipeline:
         self.total_patents = 0
         self.total_chunks = 0
 
-    def add(self, patent: dict):
-        """Process one patent: chunk, buffer, flush if batch is full."""
+    def add(self, patent: dict) -> int:
+        """Process one patent: chunk, buffer, flush if batch is full.
+        Returns number of chunks added (0 if already ingested or no content).
+        """
+        # Skip already-ingested patents
+        if patent["publication_number"] in self.existing_patents:
+            return 0
+
         chunks = chunk_patent(patent, self.cfg)
         if not chunks:
             return 0
@@ -668,19 +697,43 @@ def run_pipeline(cfg: Config):
     index_path = out_dir / cfg.index_path
     meta_path = out_dir / cfg.metadata_path
     checkpoint_path = out_dir / cfg.checkpoint_path
-    existing_outputs = [p for p in (index_path, meta_path, checkpoint_path) if p.exists()]
-    if existing_outputs:
-        existing = ", ".join(str(p) for p in existing_outputs)
-        raise SystemExit(
-            "Output directory is not clean; refusing to append duplicate chunks/vectors. "
-            f"Existing files: {existing}"
+
+    if cfg.incremental:
+        # Incremental mode: load existing index and DB, skip already-ingested
+        existing_outputs = [p for p in (index_path, meta_path) if p.exists()]
+        if not existing_outputs:
+            log.info("Incremental mode — no existing output found, starting fresh")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            meta = MetadataDB(str(meta_path))
+            existing_patents = set()
+            existing_index = None
+        else:
+            log.info("Incremental mode — loading existing index and metadata")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            meta = MetadataDB(str(meta_path))
+            existing_patents = meta.get_existing_patents()
+            existing_index = str(index_path)
+            log.info(f"  Found {len(existing_patents):,} existing patents in metadata DB")
+
+        checkpoint = Checkpoint(str(checkpoint_path))
+        pipeline = EmbedIndexPipeline(
+            cfg, meta,
+            existing_index_path=existing_index,
+            existing_patents=existing_patents,
         )
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    meta = MetadataDB(str(meta_path))
-    checkpoint = Checkpoint(str(checkpoint_path))
-    pipeline = EmbedIndexPipeline(cfg, meta)
+    else:
+        # Fresh mode: refuse to overwrite existing output
+        existing_outputs = [p for p in (index_path, meta_path, checkpoint_path) if p.exists()]
+        if existing_outputs:
+            existing = ", ".join(str(p) for p in existing_outputs)
+            raise SystemExit(
+                "Output directory is not clean; refusing to append duplicate chunks/vectors. "
+                f"Existing files: {existing}"
+            )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        meta = MetadataDB(str(meta_path))
+        checkpoint = Checkpoint(str(checkpoint_path))
+        pipeline = EmbedIndexPipeline(cfg, meta)
 
     patents_stream = stream_patents(cfg)
 
@@ -730,6 +783,8 @@ def main():
     parser.add_argument("--project", help="Your GCP project ID (for billing)")
     parser.add_argument("--limit", type=int, help="Limit patents (testing)")
     parser.add_argument("--cpc", action="append", help="Filter by CPC class (e.g. G06F16). Repeat for multiple.")
+    parser.add_argument("--publication-numbers", nargs="+", metavar="NUM",
+                        help="Specific publication numbers to fetch (e.g. US9449105B1) — each scanned at full table cost")
     parser.add_argument("--country", default="US", help="Jurisdiction (default: US)")
     parser.add_argument("--years", nargs=2, type=int, metavar=("START", "END"),
                         help="Date range e.g. 2020 2026")
@@ -739,6 +794,8 @@ def main():
                         help="Output directory (default: ./data)")
     parser.add_argument("--resume", action="store_true",
                         help="Reserved for future safe resume support; currently exits with an error")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Append to existing index instead of rebuilding from scratch")
 
     # Runtime
     parser.add_argument("--device", default="cuda",
@@ -755,6 +812,7 @@ def main():
     cfg = Config(
         project=args.project,
         limit=args.limit,
+        publication_numbers=args.publication_numbers,
         cpc=args.cpc,
         country=args.country,
         years=tuple(args.years) if args.years else None,
@@ -763,6 +821,7 @@ def main():
         device=args.device,
         output_dir=args.output,
         resume=args.resume,
+        incremental=args.incremental,
     )
 
     run_pipeline(cfg)

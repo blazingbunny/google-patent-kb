@@ -65,7 +65,8 @@ class Config:
     dataset: str = "patents-public-data"   # Public dataset project
     table: str = "patents.publications"    # Main patent table
     limit: Optional[int] = None            # For testing — limit rows
-    publication_numbers: Optional[list[str]] = None  # Specific patents to fetch
+    publication_numbers: Optional[list[str]] = None  # Specific patents to fetch (no CPC fence)
+    inventors: Optional[list[str]] = None  # Inventor names to fuzzy-match (constrained to CPC fence)
     cpc: list[str] = None                  # Filter by CPC classes (e.g. ["G06F16", "G06N"])
     country: str = "US"                    # Jurisdiction
     years: Optional[tuple] = None          # (start, end) e.g. (2015, 2026)
@@ -98,6 +99,31 @@ class Config:
 # BigQuery — query patents
 # ---------------------------------------------------------------------------
 
+def _split_pub_numbers(nums: list[str]) -> tuple[list[str], list[str]]:
+    """Split publication numbers into (exact, prefixes).
+
+    Kinded numbers (e.g. US9449105B1, US20110040768A1) carry a trailing kind
+    code and match exactly. Kindless numbers (e.g. US8612453) match by prefix so
+    they still find their kind-suffixed form (US8612453B2). Hyphens stripped,
+    uppercased — matching the BigQuery side's REPLACE(publication_number,'-','').
+    """
+    exact, prefixes = [], []
+    for n in nums:
+        s = n.strip()
+        # Accept a full Google Patents URL: take the segment after /patent/.
+        m = re.search(r"/patent/([^/?#]+)", s)
+        if m:
+            s = m.group(1)
+        # Strip a trailing language path segment (e.g. "US7974964B2/en").
+        s = re.sub(r"/[A-Za-z]{2,3}/?$", "", s)
+        s = s.replace("-", "").upper()
+        if re.search(r"\d[A-Z]\d{0,2}$", s):  # trailing kind code (serial digit + letter)
+            exact.append(s)
+        else:
+            prefixes.append(s)
+    return exact, prefixes
+
+
 def build_query(cfg: Config) -> str:
     """Build the BigQuery SQL for fetching patent data."""
     # Schema notes (verified 2025-06-07):
@@ -122,37 +148,112 @@ def build_query(cfg: Config) -> str:
         ARRAY_TO_STRING(inventor, ', ') AS inventor
     """
 
-    wheres = [
+    # Ingestion is the UNION of independent selection rules, expressed in a
+    # SINGLE table pass (the table is unpartitioned; every reference re-scans
+    # ~1.5 TB, so a multi-CTE UNION would cost 3x). Each patent is tagged by
+    # which rule(s) it satisfies, then we keep every "forced" row plus a capped
+    # background sample of CPC-fenced rows.
+    #   - CPC is the ingestion border.
+    #   - publication numbers force-include specific patents, NO CPC fence.
+    #   - inventors are fuzzy-matched but constrained to the CPC border.
+    # Each patent is one row in `pool` and is tagged once, so no UNION / no dedup.
+
+    # Pre-filters applied to the whole candidate pool.
+    common_wheres = [
         "country_code = @country",
         "kind_code IN ('A1', 'B1', 'B2')",
     ]
-    if cfg.cpc:
-        cpc_clauses = " OR ".join(
-            f"EXISTS(SELECT 1 FROM UNNEST(cpc) AS c WHERE c.code LIKE @cpc{i})"
-            for i in range(len(cfg.cpc))
-        )
-        wheres.append(f"({cpc_clauses})")
-    if cfg.publication_numbers:
-        wheres.append("REPLACE(publication_number, '-', '') IN UNNEST(@pub_numbers)")
     if cfg.years:
-        wheres.append("CAST(publication_date AS STRING) BETWEEN @start_date AND @end_date")
+        common_wheres.append(
+            "CAST(publication_date AS STRING) BETWEEN @start_date AND @end_date"
+        )
+    common_clause = "\n              AND ".join(common_wheres)
 
-    where_clause = "\n            AND ".join(wheres)
+    # CPC fence predicate (the ingestion border). Match against cpc_codes (the
+    # flattened string array carried into pool), not the raw `cpc` record column.
+    cpc_predicate = "FALSE"
+    if cfg.cpc:
+        cpc_predicate = "(" + " OR ".join(
+            f"EXISTS(SELECT 1 FROM UNNEST(cpc_codes) AS c WHERE c LIKE @cpc{i})"
+            for i in range(len(cfg.cpc))
+        ) + ")"
 
-    limit_clause = ""
-    if cfg.limit:
-        limit_clause = f"\n        LIMIT {cfg.limit}"
+    # Inventor fuzzy predicate: a single inventor string must contain BOTH the
+    # first-name and last-name token (handles "Anna Lynn Patterson", "Anna L.
+    # Patterson", "Anna Patterson", "Patterson, Anna", ...). EXISTS over the raw
+    # inventor array ensures both tokens belong to the SAME person.
+    inv_predicate = "FALSE"
+    if cfg.inventors:
+        ors = " OR ".join(
+            f"(LOWER(inv) LIKE @inv_f{i} AND LOWER(inv) LIKE @inv_l{i})"
+            for i in range(len(cfg.inventors))
+        )
+        inv_predicate = f"EXISTS(SELECT 1 FROM UNNEST(inventor_arr) AS inv WHERE {ors})"
 
-    return f"""
-        WITH selected AS (
+    # Publication-number predicate. Kinded numbers (US9449105B1) match exactly;
+    # kindless numbers (US8612453) match by prefix so they still find their
+    # kind-suffixed form (US8612453B2) instead of silently missing.
+    pub_predicate = "FALSE"
+    if cfg.publication_numbers:
+        exact, prefixes = _split_pub_numbers(cfg.publication_numbers)
+        parts = []
+        if exact:
+            parts.append("REPLACE(publication_number, '-', '') IN UNNEST(@pub_numbers)")
+        parts += [
+            f"REPLACE(publication_number, '-', '') LIKE @pubpfx{i}"
+            for i in range(len(prefixes))
+        ]
+        if parts:
+            pub_predicate = "(" + " OR ".join(parts) + ")"
+
+    # No selection rule at all → plain (optionally limited) corpus sample.
+    if not (cfg.cpc or cfg.publication_numbers or cfg.inventors):
+        limit_clause = f"\n        LIMIT {int(cfg.limit)}" if cfg.limit else ""
+        return f"""
+        WITH src AS (
             SELECT {selects}
             FROM `{cfg.dataset}.{cfg.table}`
-            WHERE {where_clause}
+            WHERE {common_clause}
+        ),
+        pool AS (
+            SELECT * FROM src
+            WHERE (description IS NOT NULL OR claims IS NOT NULL)
         )
-        SELECT *
-        FROM selected
-        WHERE (description IS NOT NULL OR claims IS NOT NULL)
-        {limit_clause}
+        SELECT * FROM pool{limit_clause}
+    """
+
+    # forced rows are always kept; background = CPC-only rows, capped by --limit.
+    forced_expr = f"({pub_predicate} OR ({cpc_predicate} AND {inv_predicate}))"
+    candidate_expr = f"({pub_predicate} OR {cpc_predicate})"
+    keep_where = (
+        f"_forced OR _bg_rank <= {int(cfg.limit)}" if cfg.limit else "TRUE"
+    )
+
+    return f"""
+        WITH src AS (
+            SELECT {selects},
+                inventor AS inventor_arr
+            FROM `{cfg.dataset}.{cfg.table}`
+            WHERE {common_clause}
+        ),
+        pool AS (
+            SELECT * FROM src
+            WHERE (description IS NOT NULL OR claims IS NOT NULL)
+        ),
+        tagged AS (
+            SELECT *, {forced_expr} AS _forced
+            FROM pool
+            WHERE {candidate_expr}
+        ),
+        ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY _forced ORDER BY publication_number
+            ) AS _bg_rank
+            FROM tagged
+        )
+        SELECT * EXCEPT(inventor_arr, _forced, _bg_rank)
+        FROM ranked
+        WHERE {keep_where}
     """
 
 
@@ -163,7 +264,19 @@ def build_query_params(cfg: Config) -> dict:
         for i, c in enumerate(cfg.cpc):
             params[f"cpc{i}"] = f"{c}%"
     if cfg.publication_numbers:
-        params["pub_numbers"] = [n.replace("-", "") for n in cfg.publication_numbers]
+        exact, prefixes = _split_pub_numbers(cfg.publication_numbers)
+        if exact:
+            params["pub_numbers"] = exact
+        for i, p in enumerate(prefixes):
+            params[f"pubpfx{i}"] = f"{p}%"
+    if cfg.inventors:
+        for i, name in enumerate(cfg.inventors):
+            # Drop punctuation, split on whitespace; first + last token only.
+            toks = name.replace(".", " ").replace(",", " ").split()
+            first = (toks[0] if toks else name).lower()
+            last = (toks[-1] if toks else name).lower()
+            params[f"inv_f{i}"] = f"%{first}%"
+            params[f"inv_l{i}"] = f"%{last}%"
     if cfg.years:
         # publication_date is INT64; CAST to STRING in WHERE, then to DATE in SELECT
         params["start_date"] = f"{cfg.years[0]}0101"
@@ -787,7 +900,9 @@ def main():
     parser.add_argument("--limit", type=int, help="Limit patents (testing)")
     parser.add_argument("--cpc", action="append", help="Filter by CPC class (e.g. G06F16). Repeat for multiple.")
     parser.add_argument("--publication-numbers", nargs="+", metavar="NUM",
-                        help="Specific publication numbers to fetch (e.g. US9449105B1) — each scanned at full table cost")
+                        help="Specific publication numbers to force-include (e.g. US9449105B1), UNIONed with the CPC sample and NOT constrained by CPC")
+    parser.add_argument("--inventors", nargs="+", metavar="NAME",
+                        help="Inventor names to fuzzy-match (e.g. 'Anna Lynn Patterson'), UNIONed with the CPC sample but constrained to the --cpc classes")
     parser.add_argument("--country", default="US", help="Jurisdiction (default: US)")
     parser.add_argument("--years", nargs=2, type=int, metavar=("START", "END"),
                         help="Date range e.g. 2020 2026")
@@ -816,6 +931,7 @@ def main():
         project=args.project,
         limit=args.limit,
         publication_numbers=args.publication_numbers,
+        inventors=args.inventors,
         cpc=args.cpc,
         country=args.country,
         years=tuple(args.years) if args.years else None,

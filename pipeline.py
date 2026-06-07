@@ -225,11 +225,17 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
         # With destination table, allow_large_results is enabled by default
         job = client.query(query, job_config=job_config)
         log.info(f"  Writing large results to {dataset_id}.{temp_table_id}...")
-        job.result()
+        # Poll for completion without fetching results (job.result() tries to
+        # fetch first-page results which can exceed the response limit).
+        import time as _time
+        while not job.done():
+            job.reload()
+            _time.sleep(2)
+        if job.errors:
+            raise RuntimeError(f"Query job failed: {job.errors}")
+        log.info(f"  Write completed ({temp_table_id}, state={job.state})")
         log.info("  Reading results from temp table...")
-        # Use TableReference object (not string) for reliable get_table + list_rows
-        dest_table_ref = dataset_ref.table(temp_table_id)
-        dest_table = client.get_table(dest_table_ref)
+        dest_table = client.get_table(table_ref)
         log.info(f"  Table found: {dest_table.table_id}, rows={dest_table.num_rows}")
         rows = client.list_rows(dest_table, page_size=500)
         result = rows  # RowIterator supports .pages

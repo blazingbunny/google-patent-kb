@@ -228,8 +228,10 @@ def stream_patents(cfg: Config) -> Generator[dict, None, None]:
         job.result()
         log.info("  Reading results from temp table...")
         table_ref = f"{dataset_id}.{temp_table_id}"
-        result = client.query(f"SELECT * FROM `{table_ref}` ORDER BY publication_number")
-        result = result.result()
+        # Stream from the temp table directly (avoids response limit)
+        dest_table = client.get_table(table_ref)
+        rows = client.list_rows(dest_table, page_size=500)
+        result = rows  # RowIterator supports .pages
         # Clean up temp table
         try:
             client.delete_table(f"{dataset_id}.{temp_table_id}")

@@ -924,6 +924,9 @@ def main():
                         help="Quantization bits (2 or 4, default: 4)")
     parser.add_argument("--model", default="BAAI/bge-large-en-v1.5",
                         help="Embedding model (default: bge-large-en-v1.5)")
+    parser.add_argument("--batch-size", type=int, default=512,
+                        help="GPU embedding batch size (default: 512 for 24GB GPUs; "
+                             "use 32 on a 16GB T4, 16 if it still OOMs)")
 
     args = parser.parse_args()
 
@@ -935,6 +938,7 @@ def main():
         cpc=args.cpc,
         country=args.country,
         years=tuple(args.years) if args.years else None,
+        embed_batch_size=args.batch_size,
         bit_width=args.bits,
         model_name=args.model,
         device=args.device,

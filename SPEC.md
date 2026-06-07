@@ -17,8 +17,10 @@ The first production corpus is intentionally narrow:
 - **Jurisdiction:** US publications only
 - **Publication kinds:** `A1`, `B1`, `B2` once the BigQuery query is corrected
 
-Expected scale is roughly **728K patents** and **6.7M chunks** (based on
-measured 9.2 chunks/patent from a test build).
+Expected scale is roughly **728K patents** and **~20M chunks** (based on
+~28 chunks/patent, recomputed after the claim-splitter fix — see §4.5). The
+earlier 6.7M figure assumed the broken splitter that collapsed nearly all
+claims into a single `claims_all` chunk.
 
 ### 1.2 Goals
 
@@ -229,8 +231,15 @@ split**, but not guaranteed clean enough to trust blindly.
 Initial splitter:
 
 ```text
-(?:^|\n)\s*(?:Claim\s+)?(\d+)[\.)]\s*
+(?:^|\n)\s*(?:Claim\s+)?(\d+)\s*[\.)]\s*
 ```
+
+The `\s*` between the claim number and its delimiter is required: BigQuery's
+`claims_localized` text formats claim markers as `1 .` (number, space,
+delimiter), not `1.`. The original `(\d+)[\.)]` pattern matched `1 .` zero
+times, so ~98% of patents fell back to `claims_all`. Measured on the 5K test
+build: the fixed pattern splits 98.2% of those fallback patents into individual
+claims (avg 20.4 claims/patent), clearing the 90% gate below.
 
 Decision:
 
@@ -277,21 +286,29 @@ pre-flight sampling.
 
 ### 4.5 Chunk count estimates (measured)
 
-Measured from a `--limit 5000` test build on 2026-06-07:
+Measured from a `--limit 5000` test build on 2026-06-07 (the build's chunker had
+the broken claim splitter; the post-fix column is recomputed from the same build's
+measured text distribution — see §4.2):
 
-| Metric | Measured | Notes |
-|---|---:|---:|
-| Chunks per patent | 9.2 | 5,000 patents → 45,949 chunks |
-| Title/abstract per patent | 1.0 | Every sampled patent had title+abstract |
-| Claims per patent | ~4.5 | Varies by patent; claims_all fallback used when regex split finds <2 boundaries |
+| Metric | As-built (broken splitter) | Post-fix (recomputed) | Notes |
+|---|---:|---:|---|
+| Chunks per patent | 9.2 | **~28** | 5,000 patents → 45,949 chunks as built |
+| Title/abstract per patent | 1.0 | 1.0 | Every sampled patent had title+abstract |
+| Claims per patent | ~1.1 | **~20** | 98.2% of patents now split into individual claims (avg 20.4) |
+| Description per patent | 7.15 | 7.15 | Unchanged by the splitter fix |
 
-Estimated full-corpus projections:
+The post-fix numbers are projected, not yet re-measured on a fresh build. The
+claim-splitter fix re-partitions the *same* claim text into ~20 rows instead of
+one `claims_all` row — it triples the **chunk/vector count** but adds almost no
+new text, so the metadata DB grows only by per-row overhead (see §9.1).
+
+Estimated full-corpus projections (post-fix):
 
 | Corpus | Patents | Estimated chunks |
 |---|---:|---:|
-| `G06F16` search-engine corpus | ~200K | ~1.8M |
-| `G06F16 ∪ G06N ∪ G06F40` | ~728K | ~6.7M |
-| Full US corpus | ~11M | ~100M |
+| `G06F16` search-engine corpus | ~200K | ~5.6M |
+| `G06F16 ∪ G06N ∪ G06F40` | ~728K | ~20M |
+| Full US corpus | ~11M | ~300M |
 
 ---
 
@@ -349,6 +366,18 @@ Use turbovec `IdMapIndex` with `chunk_id` as the external vector ID.
 | `dim` | 1024 | Derived from embedding model |
 | ID type | `uint64` | SQLite `chunk_id` values |
 
+**Calibration freezes on the first `add()`.** turbovec fits its per-coordinate
+TQ+ quantization calibration during the *first* `add_with_ids()` call and reuses
+it for every subsequent add — no retraining, no rebuilds. In a streaming build,
+this means **whatever is in the first flush batch calibrates quantization for the
+entire corpus**. If that batch is unrepresentative (e.g. all one CPC class, or
+all `title_abstract` chunks), recall can degrade across all 6.7M vectors.
+
+Mitigation: ensure the first flush is a representative mix, or warm calibration
+with one `add()` over a shuffled sample of a few thousand chunks spanning all
+chunk types and CPC classes before the main streaming loop. Measure recall
+before/after if in doubt.
+
 ### 6.2 Quantization tradeoff
 
 | Bit width | Vector size at 1024 dim | 10M vectors | Expected recall tradeoff |
@@ -387,6 +416,13 @@ Future hardening:
 - skip existing patents on resume before inserting chunks
 - load and append to existing turbovec index only when append semantics are
   explicitly tested
+
+turbovec's `IdMapIndex` exposes `remove(chunk_id)` (O(1) deletion by external
+ID). This makes upsert-style dedup feasible: on resume or re-ingest, `remove()`
+any `chunk_id` already present before re-adding, rather than requiring a clean
+rebuild. Note turbovec exposes **no API to read or iterate stored vectors/IDs**
+back out of an index — this is why `merge.py` must re-embed both inputs from
+scratch (it cannot extract vectors from existing `.tvim` files to concatenate).
 
 ---
 
@@ -558,16 +594,22 @@ Instance target:
 | Embedding (RTX 4090) | 750s | 61 chunks/sec |
 | **Total per 5K patents** | **~13 min** | **~0.4 patents/sec** |
 
-**Projected full build** (728K patents, ~6.7M chunks):
+**Projected full build** (728K patents, ~20M chunks — recomputed after the
+claim-splitter fix; the pre-fix estimates were ~30h / ~$11 / 6.7M chunks):
 
 | Metric | Estimate | Notes |
 |---|---:|---:|
-| Embedding time | ~30.5h | 6.7M / (61 chunks/s) / 3600 |
+| Embedding time | **~93h** | 20M / (61 chunks/s) / 3600 |
 | BigQuery + chunking | ~3h | Overlaps partially with embedding (streaming pipeline) |
-| **Total wall time** | **~30h** | |
-| **GPU cost** | **~$11.40** | $0.38/hr × 30h |
-| Index size | ~3.4 GB | 500 bytes/chunk × 6.7M |
-| Metadata DB size | ~67 GB | 10 KB/chunk × 6.7M (will need compression or pruning) |
+| **Total wall time** | **~93h (~4 days)** | Dominated by 3× more chunks to embed |
+| **GPU cost** | **~$35** | $0.38/hr × 93h |
+| Index size | **~11 GB** | 523 bytes/vector × 20M (measured 523 B/vector on the 5K build) |
+| Metadata DB size | **~73 GB** | Text-bound, scales with patents not chunks: 502 MB measured at 5K → ×144. The claim split adds rows but ~no new text, so this barely moves vs the pre-fix 67 GB estimate. Still needs compression or pruning. |
+
+The big cost mover is **wall time / GPU spend (~3×)**, because 3× more chunks
+must be embedded. The metadata DB and BigQuery scan cost are essentially
+unchanged by the splitter fix. Note this pushes the build above the §1.2 "<$10"
+target — budget ~$35 GPU + ~$10-20 BigQuery ≈ **~$45-55 total**.
 
 *Note: The vast.ai RTX 4090 instance used for the 5K test has since been
 destroyed. A new GPU instance must be provisioned for the full build.*

@@ -293,9 +293,12 @@ def chunk_claims(claims_text: str, patent_number: str) -> list[dict]:
     text = claims_text.replace("\r\n", "\n")
 
     # Try to split on claim boundaries
-    # Common patterns: "1.", "1) ", "Claim 1.", etc.
+    # Common patterns: "1.", "1) ", "Claim 1.", and BigQuery's "1 ." (the
+    # number and delimiter are separated by whitespace in patents-public-data,
+    # so \s* between them is required — without it the splitter fails ~98% of
+    # the time and everything falls back to claims_all).
     claim_pattern = re.compile(
-        r'(?:^|\n)\s*(?:Claim\s+)?(\d+)[\.\)]\s*',
+        r'(?:^|\n)\s*(?:Claim\s+)?(\d+)\s*[\.\)]\s*',
         re.IGNORECASE | re.MULTILINE
     )
 
